@@ -4,9 +4,14 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import "./App.css";
 
 interface ImageMetadata {
-  genre: string;
   source: string;
   author: string;
+  tags: string[];
+}
+
+interface TagWithCount {
+  tag: string;
+  count: number;
 }
 
 interface ImageReference {
@@ -15,13 +20,18 @@ interface ImageReference {
 }
 
 interface MetadataGroups {
-  genres: Record<string, ImageReference[]>;
   sources: Record<string, ImageReference[]>;
   authors: Record<string, ImageReference[]>;
+  tags: Record<string, ImageReference[]>;
+}
+
+interface FolderInfo {
+  name: string;
+  size_mb: number;
 }
 
 function App() {
-  const [folders, setFolders] = useState<string[]>([]);
+  const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [selectedFolder, setSelectedFolder] = useState<string>("");
   const [images, setImages] = useState<string[]>([]);
   const [selectedImage, setSelectedImage] = useState<string>("");
@@ -52,50 +62,96 @@ function App() {
   const [isMetadataEditorOpen, setIsMetadataEditorOpen] =
     useState<boolean>(false);
   const [editingMetadata, setEditingMetadata] = useState<ImageMetadata>({
-    genre: "",
     source: "",
     author: "",
+    tags: [],
   });
-  const [browseMode, setBrowseMode] = useState<"folders" | "metadata">(
-    "folders",
-  );
+  const [browseMode, setBrowseMode] = useState<
+    "folders" | "metadata" | "favorites"
+  >("folders");
   const [metadataGroups, setMetadataGroups] = useState<MetadataGroups | null>(
     null,
   );
   const [metadataField, setMetadataField] = useState<
-    "genres" | "sources" | "authors"
-  >("genres");
+    "sources" | "authors" | "tags"
+  >("tags");
   const [selectedMetadataValue, setSelectedMetadataValue] =
     useState<string>("");
   const imageRefsMap = useRef<Map<string, HTMLDivElement>>(new Map());
   const [isImageLoaded, setIsImageLoaded] = useState<boolean>(false);
   const [sortOrder, setSortOrder] = useState<"none" | "asc" | "desc">("none");
+  const [showOnlyNoMetadata, setShowOnlyNoMetadata] = useState<boolean>(false);
   const [isAutoAdvanceReverse, setIsAutoAdvanceReverse] =
     useState<boolean>(false);
+  const [imageMetadataMap, setImageMetadataMap] = useState<
+    Map<string, ImageMetadata>
+  >(new Map());
+  const [isBulkEditMode, setIsBulkEditMode] = useState<boolean>(false);
+  const [selectedImages, setSelectedImages] = useState<Set<string>>(new Set());
+  const [isBulkMetadataEditorOpen, setIsBulkMetadataEditorOpen] =
+    useState<boolean>(false);
+  const [tagInput, setTagInput] = useState<string>("");
+  const [allExistingTags, setAllExistingTags] = useState<TagWithCount[]>([]);
+  const [favoriteImages, setFavoriteImages] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     loadFolders();
   }, []);
 
   useEffect(() => {
-    if (selectedFolder) {
+    if (selectedFolder && browseMode === "folders") {
       loadImages(selectedFolder);
     }
-  }, [selectedFolder]);
+  }, [selectedFolder, browseMode]);
 
   useEffect(() => {
     if (selectedFolder && selectedImage) {
       setIsImageLoaded(false);
       loadImagePath(selectedFolder, selectedImage);
       loadMetadata(selectedFolder, selectedImage);
-      setZoom(1);
       const index = images.indexOf(selectedImage);
       setCurrentImageIndex(index >= 0 ? index : 0);
+
+      // サイドバーの画像リストで選択された画像にスクロール
+      const imageElement = imageRefsMap.current.get(selectedImage);
+      if (imageElement) {
+        imageElement.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
     }
   }, [selectedFolder, selectedImage, images]);
 
   useEffect(() => {
-    if (isFullscreen) {
+    if (isMetadataEditorOpen) {
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.key === "Escape") {
+          setIsMetadataEditorOpen(false);
+        } else if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+          e.preventDefault();
+          saveMetadata();
+        }
+      };
+      window.addEventListener("keydown", handleKeyDown);
+      return () => window.removeEventListener("keydown", handleKeyDown);
+    }
+  }, [isMetadataEditorOpen, editingMetadata, selectedFolder, selectedImage]);
+
+  useEffect(() => {
+    if (isBulkMetadataEditorOpen) {
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.key === "Escape") {
+          setIsBulkMetadataEditorOpen(false);
+        } else if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+          e.preventDefault();
+          saveBulkMetadata();
+        }
+      };
+      window.addEventListener("keydown", handleKeyDown);
+      return () => window.removeEventListener("keydown", handleKeyDown);
+    }
+  }, [isBulkMetadataEditorOpen, editingMetadata, selectedImages]);
+
+  useEffect(() => {
+    if (isFullscreen && !isMetadataEditorOpen && !isBulkMetadataEditorOpen) {
       const handleKeyDown = (e: KeyboardEvent) => {
         if (e.key === "Escape") {
           closeFullscreen();
@@ -108,7 +164,56 @@ function App() {
       window.addEventListener("keydown", handleKeyDown);
       return () => window.removeEventListener("keydown", handleKeyDown);
     }
-  }, [isFullscreen, currentImageIndex]);
+  }, [
+    isFullscreen,
+    currentImageIndex,
+    isMetadataEditorOpen,
+    isBulkMetadataEditorOpen,
+  ]);
+
+  useEffect(() => {
+    if (
+      mainViewMode === "single" &&
+      !isFullscreen &&
+      !isMetadataEditorOpen &&
+      !isBulkMetadataEditorOpen
+    ) {
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+          prevImage();
+        } else if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+          nextImage();
+        } else if ((e.metaKey || e.ctrlKey) && e.key === "e") {
+          e.preventDefault();
+          openMetadataEditor();
+        } else if ((e.metaKey || e.ctrlKey) && e.key === "b") {
+          e.preventDefault();
+          if (selectedFolder && selectedImage) {
+            const key = `${selectedFolder}/${selectedImage}`;
+            setFavoriteImages((prev) => {
+              const newSet = new Set(prev);
+              if (newSet.has(key)) {
+                newSet.delete(key);
+              } else {
+                newSet.add(key);
+              }
+              return newSet;
+            });
+          }
+        }
+      };
+      window.addEventListener("keydown", handleKeyDown);
+      return () => window.removeEventListener("keydown", handleKeyDown);
+    }
+  }, [
+    mainViewMode,
+    isFullscreen,
+    currentImageIndex,
+    isMetadataEditorOpen,
+    isBulkMetadataEditorOpen,
+    selectedFolder,
+    selectedImage,
+  ]);
 
   useEffect(() => {
     if (isFullscreen && isAutoAdvance) {
@@ -192,10 +297,10 @@ function App() {
 
   async function loadFolders() {
     try {
-      const folderList = await invoke<string[]>("get_image_folders");
+      const folderList = await invoke<FolderInfo[]>("get_image_folders");
       setFolders(folderList);
       if (folderList.length > 0) {
-        setSelectedFolder(folderList[0]);
+        setSelectedFolder(folderList[0].name);
       }
     } catch (error) {
       console.error("Failed to load folders:", error);
@@ -209,8 +314,9 @@ function App() {
       });
       setImages(imageList);
 
-      // Load thumbnail paths for grid view
+      // Load thumbnail paths and metadata for grid view
       const newThumbnailPaths = new Map<string, string>();
+      const newMetadataMap = new Map<string, ImageMetadata>();
       for (const image of imageList) {
         try {
           const path = await invoke<string>("get_image_path", {
@@ -218,11 +324,21 @@ function App() {
             image,
           });
           newThumbnailPaths.set(image, path);
+
+          // Load metadata for each image
+          const metadata = await invoke<ImageMetadata | null>(
+            "load_image_metadata",
+            { folder, image },
+          );
+          if (metadata) {
+            newMetadataMap.set(image, metadata);
+          }
         } catch (err) {
           console.error(`Failed to load path for ${image}:`, err);
         }
       }
       setThumbnailPaths(newThumbnailPaths);
+      setImageMetadataMap(newMetadataMap);
 
       if (imageList.length > 0) {
         setSelectedImage(imageList[0]);
@@ -264,18 +380,92 @@ function App() {
       await invoke("save_image_metadata", {
         folder: selectedFolder,
         image: selectedImage,
-        genre: editingMetadata.genre,
         source: editingMetadata.source,
         author: editingMetadata.author,
+        tags: editingMetadata.tags,
       });
       setCurrentMetadata({ ...editingMetadata });
+      // Update imageMetadataMap immediately
+      setImageMetadataMap((prev) => {
+        const newMap = new Map(prev);
+        newMap.set(selectedImage, { ...editingMetadata });
+        return newMap;
+      });
       setIsMetadataEditorOpen(false);
       // Reload metadata groups if in metadata browse mode
       if (browseMode === "metadata") {
         loadMetadataGroups();
       }
+      // Reload all tags
+      loadAllTags();
     } catch (error) {
       console.error("Failed to save metadata:", error);
+    }
+  }
+
+  async function saveBulkMetadata() {
+    if (selectedImages.size === 0) return;
+
+    try {
+      for (const image of selectedImages) {
+        await invoke("save_image_metadata", {
+          folder: selectedFolder,
+          image: image,
+          source: editingMetadata.source,
+          author: editingMetadata.author,
+          tags: editingMetadata.tags,
+        });
+      }
+      // Update imageMetadataMap for all selected images
+      setImageMetadataMap((prev) => {
+        const newMap = new Map(prev);
+        selectedImages.forEach((image) => {
+          newMap.set(image, { ...editingMetadata });
+        });
+        return newMap;
+      });
+      setIsBulkMetadataEditorOpen(false);
+      setIsBulkEditMode(false);
+      setSelectedImages(new Set());
+      // Reload metadata groups if in metadata browse mode
+      if (browseMode === "metadata") {
+        loadMetadataGroups();
+      }
+      // Reload all tags
+      loadAllTags();
+    } catch (error) {
+      console.error("Failed to save bulk metadata:", error);
+    }
+  }
+
+  function toggleImageSelection(image: string) {
+    const newSelection = new Set(selectedImages);
+    if (newSelection.has(image)) {
+      newSelection.delete(image);
+    } else {
+      newSelection.add(image);
+    }
+    setSelectedImages(newSelection);
+  }
+
+  function selectAllImages() {
+    setSelectedImages(new Set(images));
+  }
+
+  function deselectAllImages() {
+    setSelectedImages(new Set());
+  }
+
+  function openBulkMetadataEditor() {
+    setEditingMetadata({ source: "", author: "", tags: [] });
+    setIsBulkMetadataEditorOpen(true);
+    loadAllTags();
+  }
+
+  function toggleBulkEditMode() {
+    setIsBulkEditMode(!isBulkEditMode);
+    if (isBulkEditMode) {
+      setSelectedImages(new Set());
     }
   }
 
@@ -292,8 +482,9 @@ function App() {
     const imageList = refs.map((ref) => ref.image);
     setImages(imageList);
 
-    // Load thumbnail paths for all referenced images
+    // Load thumbnail paths and metadata for all referenced images
     const newThumbnailPaths = new Map<string, string>();
+    const newMetadataMap = new Map<string, ImageMetadata>();
     for (const ref of refs) {
       try {
         const path = await invoke<string>("get_image_path", {
@@ -301,11 +492,21 @@ function App() {
           image: ref.image,
         });
         newThumbnailPaths.set(ref.image, path);
+
+        // Load metadata for each image
+        const metadata = await invoke<ImageMetadata | null>(
+          "load_image_metadata",
+          { folder: ref.folder, image: ref.image },
+        );
+        if (metadata) {
+          newMetadataMap.set(ref.image, metadata);
+        }
       } catch (err) {
         console.error(`Failed to load path for ${ref.image}:`, err);
       }
     }
     setThumbnailPaths(newThumbnailPaths);
+    setImageMetadataMap(newMetadataMap);
 
     if (refs.length > 0) {
       setSelectedFolder(refs[0].folder);
@@ -316,11 +517,69 @@ function App() {
     }
   }
 
-  function openMetadataEditor() {
-    setEditingMetadata(
-      currentMetadata || { genre: "", source: "", author: "" },
-    );
-    setIsMetadataEditorOpen(true);
+  async function openMetadataEditor() {
+    // 最新のメタデータを読み込む
+    if (selectedFolder && selectedImage) {
+      try {
+        const metadata = await invoke<ImageMetadata | null>(
+          "load_image_metadata",
+          {
+            folder: selectedFolder,
+            image: selectedImage,
+          },
+        );
+        setCurrentMetadata(metadata);
+        setEditingMetadata(metadata || { source: "", author: "", tags: [] });
+        setIsMetadataEditorOpen(true);
+        loadAllTags();
+      } catch (error) {
+        console.error("Failed to load metadata:", error);
+        setEditingMetadata({ source: "", author: "", tags: [] });
+        setIsMetadataEditorOpen(true);
+        loadAllTags();
+      }
+    } else {
+      setEditingMetadata(
+        currentMetadata || { source: "", author: "", tags: [] },
+      );
+      setIsMetadataEditorOpen(true);
+      loadAllTags();
+    }
+  }
+
+  async function loadAllTags() {
+    try {
+      const tags = await invoke<TagWithCount[]>("get_all_tags_with_count");
+      setAllExistingTags(tags);
+    } catch (error) {
+      console.error("Failed to load all tags:", error);
+      setAllExistingTags([]);
+    }
+  }
+
+  function addTag(tag: string) {
+    const trimmedTag = tag.trim();
+    if (trimmedTag && !editingMetadata.tags.includes(trimmedTag)) {
+      setEditingMetadata({
+        ...editingMetadata,
+        tags: [...editingMetadata.tags, trimmedTag],
+      });
+      setTagInput("");
+    }
+  }
+
+  function removeTag(tagToRemove: string) {
+    setEditingMetadata({
+      ...editingMetadata,
+      tags: editingMetadata.tags.filter((tag) => tag !== tagToRemove),
+    });
+  }
+
+  function handleTagInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      addTag(tagInput);
+    }
   }
 
   function handleImageClick(image: string) {
@@ -393,10 +652,24 @@ function App() {
   }
 
   function getSortedImages() {
-    if (sortOrder === "none") {
-      return images;
+    let filteredImages = images;
+
+    // メタ情報なしフィルター
+    if (showOnlyNoMetadata) {
+      filteredImages = images.filter((image) => {
+        const metadata = imageMetadataMap.get(image);
+        return (
+          !metadata ||
+          (!metadata.source && !metadata.author && metadata.tags.length === 0)
+        );
+      });
     }
-    const sorted = [...images].sort((a, b) => {
+
+    // ソート
+    if (sortOrder === "none") {
+      return filteredImages;
+    }
+    const sorted = [...filteredImages].sort((a, b) => {
       if (sortOrder === "asc") {
         return a.localeCompare(b);
       } else {
@@ -418,7 +691,7 @@ function App() {
 
   return (
     <div className="app">
-      {images.length > 0 && isHeaderVisible && (
+      {isHeaderVisible && (
         <div className="custom-titlebar" data-tauri-drag-region>
           <div className="titlebar-content">
             <div className="titlebar-controls">
@@ -426,6 +699,7 @@ function App() {
                 <button
                   className={mainViewMode === "single" ? "active" : ""}
                   onClick={() => setMainViewMode("single")}
+                  disabled={images.length === 0}
                   title="単一表示"
                 >
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
@@ -443,6 +717,7 @@ function App() {
                 <button
                   className={mainViewMode === "grid" ? "active" : ""}
                   onClick={() => setMainViewMode("grid")}
+                  disabled={images.length === 0}
                   title="グリッド表示"
                 >
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
@@ -460,7 +735,7 @@ function App() {
                       onClick={() =>
                         setMainGridColumns(Math.max(2, mainGridColumns - 1))
                       }
-                      disabled={mainGridColumns <= 2}
+                      disabled={mainGridColumns <= 2 || images.length === 0}
                     >
                       &lt;
                     </button>
@@ -469,7 +744,7 @@ function App() {
                       onClick={() =>
                         setMainGridColumns(Math.min(12, mainGridColumns + 1))
                       }
-                      disabled={mainGridColumns >= 12}
+                      disabled={mainGridColumns >= 12 || images.length === 0}
                     >
                       &gt;
                     </button>
@@ -495,7 +770,7 @@ function App() {
           </div>
         </div>
       )}
-      {!isHeaderVisible && images.length > 0 && (
+      {!isHeaderVisible && (
         <button
           className="show-titlebar-btn"
           onClick={() => setIsHeaderVisible(true)}
@@ -527,7 +802,13 @@ function App() {
                   className={browseMode === "metadata" ? "active" : ""}
                   onClick={() => setBrowseMode("metadata")}
                 >
-                  タグ別
+                  メタ別
+                </button>
+                <button
+                  className={browseMode === "favorites" ? "active" : ""}
+                  onClick={() => setBrowseMode("favorites")}
+                >
+                  ★
                 </button>
               </div>
               <button
@@ -552,9 +833,9 @@ function App() {
                   <h3>Folders</h3>
                   {folders.map((folder) => (
                     <div
-                      key={folder}
-                      className={`folder-item ${selectedFolder === folder ? "selected" : ""}`}
-                      onClick={() => setSelectedFolder(folder)}
+                      key={folder.name}
+                      className={`folder-item ${selectedFolder === folder.name ? "selected" : ""}`}
+                      onClick={() => setSelectedFolder(folder.name)}
                     >
                       <svg
                         width="16"
@@ -568,28 +849,37 @@ function App() {
                           opacity="0.3"
                         />
                       </svg>
-                      {folder}
+                      <span className="folder-name">{folder.name}</span>
+                      <span className="folder-size">
+                        {folder.size_mb.toFixed(0)}MB
+                      </span>
                     </div>
                   ))}
                 </div>
               </>
-            ) : (
+            ) : browseMode === "metadata" ? (
               <div className="metadata-browser">
                 <div className="metadata-field-tabs">
                   <button
-                    className={metadataField === "genres" ? "active" : ""}
+                    className={metadataField === "tags" ? "active" : ""}
                     onClick={() => {
-                      setMetadataField("genres");
+                      setMetadataField("tags");
                       setSelectedMetadataValue("");
+                      setImages([]);
+                      setSelectedImage("");
+                      setImagePath("");
                     }}
                   >
-                    ジャンル
+                    タグ
                   </button>
                   <button
                     className={metadataField === "sources" ? "active" : ""}
                     onClick={() => {
                       setMetadataField("sources");
                       setSelectedMetadataValue("");
+                      setImages([]);
+                      setSelectedImage("");
+                      setImagePath("");
                     }}
                   >
                     元ネタ
@@ -599,6 +889,9 @@ function App() {
                     onClick={() => {
                       setMetadataField("authors");
                       setSelectedMetadataValue("");
+                      setImages([]);
+                      setSelectedImage("");
+                      setImagePath("");
                     }}
                   >
                     作者
@@ -606,7 +899,7 @@ function App() {
                 </div>
                 <div className="metadata-values-list">
                   <h3>
-                    {metadataField === "genres" && "ジャンル一覧"}
+                    {metadataField === "tags" && "タグ一覧"}
                     {metadataField === "sources" && "元ネタ一覧"}
                     {metadataField === "authors" && "作者一覧"}
                   </h3>
@@ -629,8 +922,97 @@ function App() {
                     )}
                 </div>
               </div>
-            )}
+            ) : browseMode === "favorites" ? (
+              <div className="favorites-browser">
+                <div className="favorites-list">
+                  <h3>お気に入り ({favoriteImages.size})</h3>
+                  {favoriteImages.size === 0 && (
+                    <p className="no-favorites">お気に入りがありません</p>
+                  )}
+                  {Array.from(favoriteImages).map((favKey) => {
+                    const [folder, image] = favKey.split("/");
+                    return (
+                      <div
+                        key={favKey}
+                        className={`favorite-item ${selectedFolder === folder && selectedImage === image ? "selected" : ""}`}
+                        onClick={() => {
+                          setSelectedFolder(folder);
+                          setSelectedImage(image);
+                          handleImageClick(image);
+                        }}
+                      >
+                        <span className="favorite-image-name">{image}</span>
+                        <span className="favorite-folder-name">({folder})</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
             <div className="view-controls">
+              <div className="bulk-edit-controls">
+                <button
+                  className={`bulk-edit-toggle ${isBulkEditMode ? "active" : ""}`}
+                  onClick={toggleBulkEditMode}
+                  title="一括編集モード"
+                >
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                    <path
+                      d="M3 3L6 3M3 8L6 8M3 13L6 13"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                    />
+                    <rect
+                      x="9"
+                      y="2"
+                      width="2"
+                      height="2"
+                      fill="currentColor"
+                    />
+                    <rect
+                      x="9"
+                      y="7"
+                      width="2"
+                      height="2"
+                      fill="currentColor"
+                    />
+                    <rect
+                      x="9"
+                      y="12"
+                      width="2"
+                      height="2"
+                      fill="currentColor"
+                    />
+                  </svg>
+                </button>
+                {isBulkEditMode && (
+                  <>
+                    <button
+                      className="select-all-btn"
+                      onClick={selectAllImages}
+                      title="全て選択"
+                    >
+                      全選択
+                    </button>
+                    <button
+                      className="deselect-all-btn"
+                      onClick={deselectAllImages}
+                      title="全て解除"
+                    >
+                      解除
+                    </button>
+                    <button
+                      className="bulk-edit-btn"
+                      onClick={openBulkMetadataEditor}
+                      disabled={selectedImages.size === 0}
+                      title={`選択した${selectedImages.size}件を編集`}
+                    >
+                      編集({selectedImages.size})
+                    </button>
+                  </>
+                )}
+              </div>
               <div className="view-mode-toggle">
                 <button
                   className={viewMode === "list" ? "active" : ""}
@@ -686,22 +1068,40 @@ function App() {
             </div>
             <div className="image-list">
               <div className="image-list-header">
-                <h3>画像一覧 ({images.length})</h3>
-                <button
-                  className={`sort-btn ${sortOrder !== "none" ? "active" : ""}`}
-                  onClick={toggleSortOrder}
-                  title={
-                    sortOrder === "none"
-                      ? "ソート: なし"
-                      : sortOrder === "asc"
-                        ? "ソート: A-Z"
-                        : "ソート: Z-A"
-                  }
-                >
-                  {sortOrder === "asc" && "A-Z"}
-                  {sortOrder === "desc" && "Z-A"}
-                  {sortOrder === "none" && "↑↓"}
-                </button>
+                <h3>画像一覧 ({getSortedImages().length})</h3>
+                <div className="list-controls">
+                  <button
+                    className={`filter-btn ${showOnlyNoMetadata ? "active" : ""}`}
+                    onClick={() => setShowOnlyNoMetadata(!showOnlyNoMetadata)}
+                    title={
+                      showOnlyNoMetadata ? "すべて表示" : "メタ情報なしのみ表示"
+                    }
+                  >
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                      <path
+                        d="M2 4H14M4 8H12M6 12H10"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                      />
+                    </svg>
+                  </button>
+                  <button
+                    className={`sort-btn ${sortOrder !== "none" ? "active" : ""}`}
+                    onClick={toggleSortOrder}
+                    title={
+                      sortOrder === "none"
+                        ? "ソート: なし"
+                        : sortOrder === "asc"
+                          ? "ソート: A-Z"
+                          : "ソート: Z-A"
+                    }
+                  >
+                    {sortOrder === "asc" && "A-Z"}
+                    {sortOrder === "desc" && "Z-A"}
+                    {sortOrder === "none" && "↑↓"}
+                  </button>
+                </div>
               </div>
               {images.length === 0 && selectedFolder && (
                 <p className="no-images">画像がありません</p>
@@ -710,6 +1110,13 @@ function App() {
                 getSortedImages().map((image, _index) => (
                   <div
                     key={image}
+                    ref={(el) => {
+                      if (el) {
+                        imageRefsMap.current.set(image, el);
+                      } else {
+                        imageRefsMap.current.delete(image);
+                      }
+                    }}
                     className={`image-item ${selectedImage === image ? "selected" : ""}`}
                     onClick={() => handleImageClick(image)}
                   >
@@ -723,13 +1130,42 @@ function App() {
                 >
                   {getSortedImages().map((image, _index) => {
                     const thumbPath = thumbnailPaths.get(image);
+                    const metadata = imageMetadataMap.get(image);
+                    const hasMetadata =
+                      metadata &&
+                      (metadata.source ||
+                        metadata.author ||
+                        metadata.tags.length > 0);
+                    const isSelected = selectedImages.has(image);
+                    const isCurrentImage = selectedImage === image;
                     return (
                       <div
                         key={image}
-                        className="grid-item"
-                        onClick={() => handleImageClick(image)}
+                        ref={(el) => {
+                          if (el) {
+                            imageRefsMap.current.set(image, el);
+                          } else {
+                            imageRefsMap.current.delete(image);
+                          }
+                        }}
+                        className={`grid-item ${isSelected ? "selected-for-edit" : ""} ${isCurrentImage ? "current-image" : ""}`}
+                        onClick={() =>
+                          isBulkEditMode
+                            ? toggleImageSelection(image)
+                            : handleImageClick(image)
+                        }
                         title={image}
                       >
+                        {isBulkEditMode && (
+                          <div className="selection-checkbox">
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => toggleImageSelection(image)}
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                          </div>
+                        )}
                         <div className="grid-item-thumbnail">
                           {thumbPath ? (
                             <img src={convertFileSrc(thumbPath)} alt={image} />
@@ -751,6 +1187,29 @@ function App() {
                                 strokeWidth="2"
                               />
                             </svg>
+                          )}
+                          {hasMetadata && (
+                            <div className="metadata-tag-icon">
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="16"
+                                height="16"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="#ff6a00"
+                                strokeWidth="3.75"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                              >
+                                <path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z" />
+                                <circle
+                                  cx="7.5"
+                                  cy="7.5"
+                                  r=".5"
+                                  fill="#ff6a00"
+                                />
+                              </svg>
+                            </div>
                           )}
                         </div>
                         {/* <div className="grid-item-name">{image}</div> */}
@@ -797,16 +1256,6 @@ function App() {
                   </svg>
                 </button>
                 <span className="zoom-level">{Math.round(zoom * 100)}%</span>
-                <button onClick={handleResetZoom} title="リセット">
-                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                    <path
-                      d="M8 4V12M4 8H12"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                    />
-                  </svg>
-                </button>
                 <button onClick={handleZoomIn} title="拡大 (Ctrl + スクロール)">
                   <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                     <path
@@ -817,24 +1266,34 @@ function App() {
                     />
                   </svg>
                 </button>
+                <button
+                  className="reset-zoom-btn"
+                  onClick={handleResetZoom}
+                  title="リセット"
+                >
+                  Reset
+                </button>
               </div>
               {currentMetadata && (
                 <div className="metadata-display">
                   <div className="metadata-item">
-                    <strong>ジャンル:</strong> {currentMetadata.genre}
+                    <strong>タグ:</strong>{" "}
+                    {currentMetadata.tags.length > 0
+                      ? currentMetadata.tags.join(", ")
+                      : "不明"}
                   </div>
                   <div className="metadata-item">
-                    <strong>元ネタ:</strong> {currentMetadata.source}
+                    <strong>元ネタ:</strong> {currentMetadata.source || "不明"}
                   </div>
                   <div className="metadata-item">
-                    <strong>作者:</strong> {currentMetadata.author}
+                    <strong>作者:</strong> {currentMetadata.author || "不明"}
                   </div>
                 </div>
               )}
               <button
                 className="edit-metadata-btn"
                 onClick={openMetadataEditor}
-                title="情報を編集"
+                title="情報を編集 (Cmd + E)"
               >
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                   <path
@@ -845,6 +1304,41 @@ function App() {
                     strokeLinejoin="round"
                   />
                 </svg>
+                <span className="btn-label">(Cmd + E)</span>
+              </button>
+              <button
+                className={`favorite-btn ${selectedImage && favoriteImages.has(`${selectedFolder}/${selectedImage}`) ? "active" : ""}`}
+                onClick={() => {
+                  if (selectedFolder && selectedImage) {
+                    const key = `${selectedFolder}/${selectedImage}`;
+                    setFavoriteImages((prev) => {
+                      const newSet = new Set(prev);
+                      if (newSet.has(key)) {
+                        newSet.delete(key);
+                      } else {
+                        newSet.add(key);
+                      }
+                      return newSet;
+                    });
+                  }
+                }}
+                title="お気に入り (Cmd + B)"
+              >
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                  <path
+                    d="M8 2L9.5 6.5H14L10.5 9.5L12 14L8 11L4 14L5.5 9.5L2 6.5H6.5L8 2Z"
+                    fill={
+                      selectedImage &&
+                      favoriteImages.has(`${selectedFolder}/${selectedImage}`)
+                        ? "#FFD700"
+                        : "none"
+                    }
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+                <span className="btn-label">(Cmd + B)</span>
               </button>
               <div className="image-container">
                 <img
@@ -1124,22 +1618,151 @@ function App() {
             className="metadata-editor-content"
             onClick={(e) => e.stopPropagation()}
           >
+            <button
+              className="modal-close-btn"
+              onClick={() => setIsMetadataEditorOpen(false)}
+              title="閉じる (Esc)"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                <path
+                  d="M6 6L18 18M6 18L18 6"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
             <h3>画像情報の編集</h3>
             <div className="metadata-form">
-              <div className="form-group">
-                <label>ジャンル</label>
-                <input
-                  type="text"
-                  value={editingMetadata.genre}
-                  onChange={(e) =>
-                    setEditingMetadata({
-                      ...editingMetadata,
-                      genre: e.target.value,
-                    })
-                  }
-                  placeholder="例: アニメ, ゲーム, オリジナル"
-                />
+              <div className="metadata-form-left">
+                <div className="form-group">
+                  <label>元ネタ</label>
+                  <input
+                    type="text"
+                    value={editingMetadata.source}
+                    onChange={(e) =>
+                      setEditingMetadata({
+                        ...editingMetadata,
+                        source: e.target.value,
+                      })
+                    }
+                    placeholder="例: 作品名、シリーズ名"
+                  />
+                </div>
+                <div className="form-group">
+                  <label>作者</label>
+                  <input
+                    type="text"
+                    value={editingMetadata.author}
+                    onChange={(e) =>
+                      setEditingMetadata({
+                        ...editingMetadata,
+                        author: e.target.value,
+                      })
+                    }
+                    placeholder="例: イラストレーター名"
+                  />
+                </div>
+                <div className="form-group">
+                  <label>タグ</label>
+                  <div className="tag-input-container">
+                    <input
+                      type="text"
+                      value={tagInput}
+                      onChange={(e) => setTagInput(e.target.value)}
+                      onKeyDown={handleTagInputKeyDown}
+                      placeholder="タグを入力してEnter"
+                    />
+                    <button
+                      type="button"
+                      className="add-tag-btn"
+                      onClick={() => addTag(tagInput)}
+                    >
+                      追加
+                    </button>
+                  </div>
+                  {editingMetadata.tags.length > 0 && (
+                    <div className="current-tags">
+                      {editingMetadata.tags.map((tag) => (
+                        <span key={tag} className="tag-chip">
+                          {tag}
+                          <button
+                            type="button"
+                            onClick={() => removeTag(tag)}
+                            className="remove-tag-btn"
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
+              <div className="metadata-form-right">
+                {allExistingTags.length > 0 && (
+                  <div className="existing-tags">
+                    <div className="existing-tags-label">既存のタグ:</div>
+                    <div className="existing-tags-list">
+                      {allExistingTags
+                        .filter(
+                          (tagData) =>
+                            !editingMetadata.tags.includes(tagData.tag),
+                        )
+                        .map((tagData) => (
+                          <button
+                            key={tagData.tag}
+                            type="button"
+                            className="existing-tag-btn"
+                            onClick={() => addTag(tagData.tag)}
+                          >
+                            {tagData.tag} ({tagData.count})
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="metadata-editor-actions">
+              <button
+                className="cancel-btn"
+                onClick={() => setIsMetadataEditorOpen(false)}
+              >
+                キャンセル (Esc)
+              </button>
+              <button className="save-btn" onClick={saveMetadata}>
+                保存 (Cmd + Enter)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {isBulkMetadataEditorOpen && (
+        <div
+          className="metadata-editor-modal"
+          onClick={() => setIsBulkMetadataEditorOpen(false)}
+        >
+          <div
+            className="metadata-editor-content"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              className="modal-close-btn"
+              onClick={() => setIsBulkMetadataEditorOpen(false)}
+              title="閉じる (Esc)"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                <path
+                  d="M6 6L18 18M6 18L18 6"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
+            <h3>一括編集 ({selectedImages.size}件)</h3>
+            <div className="metadata-form">
               <div className="form-group">
                 <label>元ネタ</label>
                 <input
@@ -1168,16 +1791,73 @@ function App() {
                   placeholder="例: イラストレーター名"
                 />
               </div>
+              <div className="form-group">
+                <label>タグ</label>
+                <div className="tag-input-container">
+                  <input
+                    type="text"
+                    value={tagInput}
+                    onChange={(e) => setTagInput(e.target.value)}
+                    onKeyDown={handleTagInputKeyDown}
+                    placeholder="タグを入力してEnter"
+                  />
+                  <button
+                    type="button"
+                    className="add-tag-btn"
+                    onClick={() => addTag(tagInput)}
+                  >
+                    追加
+                  </button>
+                </div>
+                {editingMetadata.tags.length > 0 && (
+                  <div className="current-tags">
+                    {editingMetadata.tags.map((tag) => (
+                      <span key={tag} className="tag-chip">
+                        {tag}
+                        <button
+                          type="button"
+                          onClick={() => removeTag(tag)}
+                          className="remove-tag-btn"
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {allExistingTags.length > 0 && (
+                  <div className="existing-tags">
+                    <div className="existing-tags-label">既存のタグ:</div>
+                    <div className="existing-tags-list">
+                      {allExistingTags
+                        .filter(
+                          (tagData) =>
+                            !editingMetadata.tags.includes(tagData.tag),
+                        )
+                        .map((tagData) => (
+                          <button
+                            key={tagData.tag}
+                            type="button"
+                            className="existing-tag-btn"
+                            onClick={() => addTag(tagData.tag)}
+                          >
+                            {tagData.tag} ({tagData.count})
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
             <div className="metadata-editor-actions">
               <button
                 className="cancel-btn"
-                onClick={() => setIsMetadataEditorOpen(false)}
+                onClick={() => setIsBulkMetadataEditorOpen(false)}
               >
-                キャンセル
+                キャンセル (Esc)
               </button>
-              <button className="save-btn" onClick={saveMetadata}>
-                保存
+              <button className="save-btn" onClick={saveBulkMetadata}>
+                保存 (Cmd + Enter)
               </button>
             </div>
           </div>

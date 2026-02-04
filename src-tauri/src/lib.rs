@@ -6,9 +6,9 @@ mod plugins;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct ImageMetadata {
-    genre: String,
     source: String,
     author: String,
+    tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -19,13 +19,43 @@ struct ImageReference {
 
 #[derive(Serialize, Deserialize)]
 struct MetadataGroups {
-    genres: HashMap<String, Vec<ImageReference>>,
     sources: HashMap<String, Vec<ImageReference>>,
     authors: HashMap<String, Vec<ImageReference>>,
+    tags: HashMap<String, Vec<ImageReference>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FolderInfo {
+    name: String,
+    size_mb: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TagWithCount {
+    tag: String,
+    count: usize,
+}
+
+fn get_folder_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut total_size = 0u64;
+    
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                total_size += entry.metadata()?.len();
+            } else if path.is_dir() {
+                total_size += get_folder_size(&path)?;
+            }
+        }
+    }
+    
+    Ok(total_size)
 }
 
 #[tauri::command]
-fn get_image_folders() -> Result<Vec<String>, String> {
+fn get_image_folders() -> Result<Vec<FolderInfo>, String> {
     use std::fs;
 
     let home_dir = dirs::home_dir()
@@ -42,14 +72,21 @@ fn get_image_folders() -> Result<Vec<String>, String> {
             if let Ok(entry) = entry {
                 if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                     if let Some(folder_name) = entry.file_name().to_str() {
-                        folders.push(folder_name.to_string());
+                        let folder_path = entry.path();
+                        let size_bytes = get_folder_size(&folder_path).unwrap_or(0);
+                        let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
+                        
+                        folders.push(FolderInfo {
+                            name: folder_name.to_string(),
+                            size_mb,
+                        });
                     }
                 }
             }
         }
     }
 
-    folders.sort();
+    folders.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(folders)
 }
 
@@ -99,7 +136,7 @@ fn get_image_path(folder: &str, image: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn save_image_metadata(folder: &str, image: &str, genre: &str, source: &str, author: &str) -> Result<(), String> {
+fn save_image_metadata(folder: &str, image: &str, source: &str, author: &str, tags: Vec<String>) -> Result<(), String> {
     use std::fs;
 
     let home_dir = dirs::home_dir()
@@ -110,9 +147,9 @@ fn save_image_metadata(folder: &str, image: &str, genre: &str, source: &str, aut
         .map_err(|e| format!("Failed to create metadata directory: {}", e))?;
 
     let metadata = ImageMetadata {
-        genre: genre.to_string(),
         source: source.to_string(),
         author: author.to_string(),
+        tags,
     };
 
     let metadata_file = metadata_dir.join(format!("{}.json", image));
@@ -145,10 +182,19 @@ fn load_image_metadata(folder: &str, image: &str) -> Result<Option<ImageMetadata
     let json = fs::read_to_string(&metadata_file)
         .map_err(|e| format!("Failed to read metadata: {}", e))?;
     
-    let metadata: ImageMetadata = serde_json::from_str(&json)
-        .map_err(|e| format!("Failed to parse metadata: {}", e))?;
-
-    Ok(Some(metadata))
+    // Try to parse metadata with error recovery
+    match serde_json::from_str::<ImageMetadata>(&json) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(e) => {
+            // Log the error but return empty metadata instead of failing
+            eprintln!("Warning: Failed to parse metadata for {}/{}: {}. Using defaults.", folder, image, e);
+            Ok(Some(ImageMetadata {
+                source: String::new(),
+                author: String::new(),
+                tags: Vec::new(),
+            }))
+        }
+    }
 }
 
 #[tauri::command]
@@ -159,12 +205,12 @@ fn get_metadata_groups() -> Result<MetadataGroups, String> {
         .ok_or("Failed to get home directory")?;
     let metadata_base = home_dir.join(".config").join("waifurary").join("metadata");
 
-    let mut genres: HashMap<String, Vec<ImageReference>> = HashMap::new();
     let mut sources: HashMap<String, Vec<ImageReference>> = HashMap::new();
     let mut authors: HashMap<String, Vec<ImageReference>> = HashMap::new();
+    let mut tags: HashMap<String, Vec<ImageReference>> = HashMap::new();
 
     if !metadata_base.exists() {
-        return Ok(MetadataGroups { genres, sources, authors });
+        return Ok(MetadataGroups { sources, authors, tags });
     }
 
     // Iterate through folders
@@ -189,13 +235,6 @@ fn get_metadata_groups() -> Result<MetadataGroups, String> {
                                                 image: image_name,
                                             };
 
-                                            // Add to genre group
-                                            if !metadata.genre.is_empty() {
-                                                genres.entry(metadata.genre.clone())
-                                                    .or_insert_with(Vec::new)
-                                                    .push(img_ref.clone());
-                                            }
-
                                             // Add to source group
                                             if !metadata.source.is_empty() {
                                                 sources.entry(metadata.source.clone())
@@ -207,7 +246,14 @@ fn get_metadata_groups() -> Result<MetadataGroups, String> {
                                             if !metadata.author.is_empty() {
                                                 authors.entry(metadata.author.clone())
                                                     .or_insert_with(Vec::new)
-                                                    .push(img_ref);
+                                                    .push(img_ref.clone());
+                                            }
+
+                                            // Add to tag groups
+                                            for tag in &metadata.tags {
+                                                tags.entry(tag.clone())
+                                                    .or_insert_with(Vec::new)
+                                                    .push(img_ref.clone());
                                             }
                                         }
                                     }
@@ -220,7 +266,111 @@ fn get_metadata_groups() -> Result<MetadataGroups, String> {
         }
     }
 
-    Ok(MetadataGroups { genres, sources, authors })
+    Ok(MetadataGroups { sources, authors, tags })
+}
+
+#[tauri::command]
+fn get_all_tags() -> Result<Vec<String>, String> {
+    use std::fs;
+    use std::collections::HashSet;
+
+    let home_dir = dirs::home_dir()
+        .ok_or("Failed to get home directory")?;
+    let metadata_base = home_dir.join(".config").join("waifurary").join("metadata");
+
+    let mut all_tags: HashSet<String> = HashSet::new();
+
+    if !metadata_base.exists() {
+        return Ok(Vec::new());
+    }
+
+    // Iterate through folders
+    if let Ok(folder_entries) = fs::read_dir(&metadata_base) {
+        for folder_entry in folder_entries {
+            if let Ok(folder_entry) = folder_entry {
+                if folder_entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    // Iterate through metadata files in folder
+                    if let Ok(file_entries) = fs::read_dir(folder_entry.path()) {
+                        for file_entry in file_entries {
+                            if let Ok(file_entry) = file_entry {
+                                let file_name = file_entry.file_name().to_string_lossy().to_string();
+                                if file_name.ends_with(".json") {
+                                    // Read metadata file
+                                    if let Ok(json) = fs::read_to_string(file_entry.path()) {
+                                        if let Ok(metadata) = serde_json::from_str::<ImageMetadata>(&json) {
+                                            for tag in metadata.tags {
+                                                all_tags.insert(tag);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sorted_tags: Vec<String> = all_tags.into_iter().collect();
+    sorted_tags.sort();
+    Ok(sorted_tags)
+}
+
+#[tauri::command]
+fn get_all_tags_with_count() -> Result<Vec<TagWithCount>, String> {
+    use std::fs;
+    use std::collections::HashMap;
+
+    let home_dir = dirs::home_dir()
+        .ok_or("Failed to get home directory")?;
+    let metadata_base = home_dir.join(".config").join("waifurary").join("metadata");
+
+    let mut tag_counts: HashMap<String, usize> = HashMap::new();
+
+    if !metadata_base.exists() {
+        return Ok(Vec::new());
+    }
+
+    // Iterate through folders
+    if let Ok(folder_entries) = fs::read_dir(&metadata_base) {
+        for folder_entry in folder_entries {
+            if let Ok(folder_entry) = folder_entry {
+                if folder_entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    // Iterate through metadata files in folder
+                    if let Ok(file_entries) = fs::read_dir(folder_entry.path()) {
+                        for file_entry in file_entries {
+                            if let Ok(file_entry) = file_entry {
+                                let file_name = file_entry.file_name().to_string_lossy().to_string();
+                                if file_name.ends_with(".json") {
+                                    // Read metadata file
+                                    if let Ok(json) = fs::read_to_string(file_entry.path()) {
+                                        if let Ok(metadata) = serde_json::from_str::<ImageMetadata>(&json) {
+                                            for tag in metadata.tags {
+                                                *tag_counts.entry(tag).or_insert(0) += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<TagWithCount> = tag_counts
+        .into_iter()
+        .map(|(tag, count)| TagWithCount { tag, count })
+        .collect();
+    
+    // Sort by count (descending), then by tag name (ascending)
+    result.sort_by(|a, b| {
+        b.count.cmp(&a.count).then_with(|| a.tag.cmp(&b.tag))
+    });
+    
+    Ok(result)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -234,7 +384,9 @@ pub fn run() {
             get_image_path,
             save_image_metadata,
             load_image_metadata,
-            get_metadata_groups
+            get_metadata_groups,
+            get_all_tags,
+            get_all_tags_with_count
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
